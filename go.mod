@@ -1,4 +1,4 @@
-module gitee.com/BirenTechnology/k8s-device-plugin
+module github.com/Project-HAMi/biren-device-plugin
 
 go 1.16
 
