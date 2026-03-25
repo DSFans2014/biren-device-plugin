@@ -1,6 +1,6 @@
 module github.com/Project-HAMi/biren-device-plugin
 
-go 1.16
+go 1.19
 
 require (
 	gitee.com/BirenTechnology/go-brml v0.0.0-20250314082319-8998101c6789
