@@ -23,8 +23,11 @@ import (
 
 	"gitee.com/BirenTechnology/go-brml/brml"
 	"github.com/Project-HAMi/biren-device-plugin/pkg/utils"
+	"github.com/Project-HAMi/biren-device-plugin/pkg/utils/nodelock"
 
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
@@ -210,6 +213,7 @@ func (p *Plugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListA
 			}
 		}
 		s.Send(&pluginapi.ListAndWatchResponse{Devices: devs})
+		RegisterHAMi(devs)
 	}
 	// reload at first start
 	reload()
@@ -240,11 +244,76 @@ func (p *Plugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListA
 }
 
 func (p *Plugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
+	var current *v1.Pod
+	success := false
+	defer func() {
+		if success {
+			annotations := make(map[string]string)
+			annotations[utils.DeviceBindPhase] = utils.DeviceBindSuccess
+			err := utils.PatchPodAnnotations(current, annotations)
+			if err != nil {
+				logrus.Errorf("patch pod %s annotations error: %v", current.Name, err)
+			}
+		}
+		ns := current.Namespace
+		name := current.Name
+		pod, err := utils.GetPod(ctx, ns, name)
+		if err != nil {
+			logrus.Errorf("get pod failed. ns %s name %s error: %v", ns, name, err)
+		} else {
+			_, _, err := utils.GetNextDeviceRequest(utils.DeviceType, *pod)
+			if err != nil {
+				logrus.Infof("no device request. release nodelock %s", nodelock.NodeLockKey)
+				lockerr := nodelock.ReleaseNodeLock(GetNodeName(), nodelock.NodeLockKey, pod, success)
+				if lockerr != nil {
+					logrus.Errorf("failed to release lock:%s", lockerr.Error())
+				}
+			}
+		}
+	}()
+	current, err := utils.GetPendingPod(ctx, GetNodeName())
+	if err != nil {
+		logrus.Errorf("get pending pod error: %v", err)
+		return nil, fmt.Errorf("get pending pod error: %v", err)
+	}
+
 	responses := pluginapi.AllocateResponse{}
 	for _, req := range r.ContainerRequests {
+
+		_, devreq, err := utils.GetNextDeviceRequest(utils.DeviceType, *current)
+
+		if err != nil {
+			utils.PodAllocationFailed(GetNodeName(), current)
+			return nil, err
+		}
+		if len(devreq) != len(req.DevicesIDs) {
+			utils.PodAllocationFailed(GetNodeName(), current)
+			return nil, fmt.Errorf("device number not matched")
+		}
+
+		ids := make([]string, 0, len(devreq))
+
+		for _, val := range devreq {
+			exist, err := p.gpuExist(val.UUID)
+			if err != nil {
+				return nil, err
+			}
+			if !exist {
+				log.Errorf("Invalid allocation request for %s: unknown device %s", p.resourceName, val.UUID)
+				return nil, fmt.Errorf("invalid allocation request for %s: unknown device %s", p.resourceName, val.UUID)
+			}
+			ids = append(ids, val.UUID)
+		}
+
+		err = utils.EraseNextDeviceTypeFromAnnotation(utils.DeviceType, *current)
+		if err != nil {
+			utils.PodAllocationFailed(GetNodeName(), current)
+			return nil, err
+		}
+
 		response := pluginapi.ContainerAllocateResponse{}
 		if CdiFeature {
-			for _, id := range req.DevicesIDs {
+			for _, id := range ids {
 				response.CDIDevices = append(response.CDIDevices, &pluginapi.CDIDevice{
 					Name: fmt.Sprintf("%s/%s=%s", vendor, p.getResourceByCardId(ContainerRuntime(p.Runtime), id), id),
 				})
@@ -264,16 +333,7 @@ func (p *Plugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*p
 				response.Devices = append(response.Devices, driDevs...)
 			}
 
-			for _, id := range req.DevicesIDs {
-				exist, err := p.gpuExist(id)
-				if err != nil {
-					return nil, err
-				}
-				if !exist {
-					log.Errorf("Invalid allocation request for %s: unknown device %s", p.resourceName, id)
-					return nil, fmt.Errorf("invalid allocation request for %s: unknown device %s", p.resourceName, id)
-				}
-
+			for _, id := range ids {
 				devpath := fmt.Sprintf("/dev/biren/%s", id)
 				dev := pluginapi.DeviceSpec{
 					HostPath:      devpath,
@@ -286,7 +346,7 @@ func (p *Plugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*p
 			}
 		}
 		if p.Runtime == string(RuntimeKata) {
-			for _, id := range req.DevicesIDs {
+			for _, id := range ids {
 				dev := pluginapi.DeviceSpec{
 					HostPath:      id,
 					ContainerPath: id,
@@ -297,7 +357,7 @@ func (p *Plugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*p
 			}
 		}
 		response.Envs = map[string]string{
-			allocatedDeviceEnv: strings.Join(req.DevicesIDs, ","),
+			allocatedDeviceEnv: strings.Join(ids, ","),
 		}
 		responses.ContainerResponses = append(responses.ContainerResponses, &response)
 	}
