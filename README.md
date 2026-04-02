@@ -1,5 +1,12 @@
 # Biren Device Plugin
 
+## Prerequisites
+
+The list of prerequisites for running the Biren device plugin is described below:
+
+1.  Biren GPU Driver >= 1.2.2
+2.  Kubernetes >=1.13
+
 ## Deployment
 
 ### Label the Node with `birentech.com=gpu`
